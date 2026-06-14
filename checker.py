@@ -1,6 +1,10 @@
 """
 Job Notifier — checks 500+ companies via ATS APIs + scraping
-Sends email on new fresher/SDE/ML openings
+Sends email on new FRESHER / INTERNSHIP openings that an India-based
+candidate can realistically apply to:
+  - Roles based in India
+  - Worldwide / global remote roles
+  - Roles that explicitly offer visa sponsorship or relocation support
 """
 
 import os
@@ -21,21 +25,78 @@ RECEIVER_EMAIL  = os.environ["RECEIVER_EMAIL"]    # where to receive alerts (can
 
 SEEN_FILE = "data/seen_jobs.json"
 
+# ─── FILTERS: ROLE TYPE (fresher / internship / entry-level ONLY) ─────────────
 KEYWORDS = [
-    "software engineer", "sde", "software developer", "backend engineer",
-    "data scientist", "ml engineer", "machine learning", "ai engineer",
-    "platform engineer", "site reliability", "sre", "devops",
-    "full stack", "fullstack", "associate engineer", "graduate engineer",
-    "fresher", "fresh graduate", "entry level", "new grad", "campus hire",
-    "data analyst", "data engineer", "analyst", "associate", "intern", "internship", "remote",
-    "golang", "go"
+    # Internships
+    "intern", "internship", "summer intern", "winter intern",
+    "graduate intern", "research intern", "co-op", "coop",
+    # Freshers / entry level
+    "fresher", "freshers", "fresh graduate", "entry level", "entry-level",
+    "early career", "early talent", "new grad", "new graduate",
+    "campus hire", "campus recruitment", "graduate program",
+    "graduate scheme", "graduate engineer", "graduate trainee",
+    "graduate ",  # catches "Graduate Software Engineer", "Graduate Developer", etc.
+    # Junior / first-job titles
+    "associate engineer", "associate software engineer",
+    "junior engineer", "junior developer", "junior software engineer",
+    "trainee", "trainee engineer", "apprentice", "apprenticeship",
+    "software engineer i", "swe i", "engineer i",
+    "sde 1", "sde-1", "sde i", "sde-i",
+    "l1 engineer", "level 1 engineer",
 ]
 
+# ─── FILTERS: EXCLUDE EXPERIENCED / SENIOR ROLES ──────────────────────────────
 EXCLUDE_KEYWORDS = [
-    "senior", "staff", "principal", "director", "manager", "head of",
-    "lead", "vp ", "vice president", "10+", "8+ years", "7+ years",
-    "6+ years", "5+ years",
+    "senior", "sr.", " sr ", "staff", "principal", "lead ", "leadership",
+    "director", "head of", "vp ", "vice president", "architect",
+    "manager", "expert", "specialist iii", "specialist iv",
+    "experienced professional", "experienced engineer",
+    "minimum 2 years", "minimum 3 years", "minimum of 2 years",
+    "2+ years", "3+ years", "4+ years", "5+ years", "6+ years",
+    "7+ years", "8+ years", "9+ years", "10+ years", "10+",
 ]
+
+# ─── FILTERS: ELIGIBILITY FOR INDIAN CANDIDATES ───────────────────────────────
+# A job qualifies if it's based in India, OR is a worldwide/global remote
+# role, OR explicitly offers visa sponsorship / relocation support.
+
+INDIA_LOCATION_KEYWORDS = [
+    "india", "bengaluru", "bangalore", "hyderabad", "pune", "mumbai",
+    "delhi", "ncr", "gurugram", "gurgaon", "noida", "chennai", "kolkata",
+    "ahmedabad", "kochi", "coimbatore",
+]
+
+REMOTE_GLOBAL_KEYWORDS = [
+    "remote - worldwide", "remote (worldwide)", "remote-worldwide",
+    "remote - global", "remote (global)", "global remote",
+    "remote - anywhere", "remote (anywhere)", "work from anywhere",
+    "anywhere in the world", "fully remote", "100% remote",
+    "remote first", "remote-first", "open to candidates worldwide",
+    "international remote", "distributed team", "remote, global",
+]
+
+# If a "remote" posting explicitly restricts to another region, it does NOT
+# count as "worldwide" even if it also mentions "remote".
+REMOTE_RESTRICTED_KEYWORDS = [
+    "us only", "u.s. only", "usa only", "us-based", "us based",
+    "united states only", "us citizens", "us citizenship",
+    "must be located in the us", "must reside in the us",
+    "within the united states", "eu only", "emea only", "europe only",
+    "uk only", "within the eu", "within the uk", "canada only",
+    "latam only", "americas only", "apac only",
+]
+
+VISA_SPONSORSHIP_KEYWORDS = [
+    "visa sponsorship", "sponsor visa", "sponsorship available",
+    "will sponsor", "able to sponsor", "work visa", "h-1b", "h1b",
+    "relocation assistance", "relocation support", "relocation package",
+    "immigration support", "work permit sponsorship", "sponsor work permit",
+]
+
+# Set to True to treat a bare "Remote" location (no region specified) as
+# potentially open to India-based candidates. This widens results but may
+# also pull in roles that are actually restricted to US/EU/etc.
+TREAT_PLAIN_REMOTE_AS_GLOBAL = False
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
@@ -436,10 +497,45 @@ def job_id(company: str, title: str, url: str) -> str:
     return hashlib.md5(f"{company}|{title}|{url}".encode()).hexdigest()
 
 def is_relevant(title: str) -> bool:
+    """Title must look like a fresher / internship / entry-level role."""
     t = title.lower()
     if any(ex in t for ex in EXCLUDE_KEYWORDS):
         return False
     return any(kw in t for kw in KEYWORDS)
+
+def is_india_eligible(location: str = "", content: str = "", title: str = ""):
+    """
+    Returns (eligible, reason).
+
+    eligible is True if an India-based candidate can realistically apply:
+      - the role is based in India, OR
+      - it's a worldwide / global remote role, OR
+      - it explicitly mentions visa sponsorship or relocation support.
+
+    `reason` is a short human-readable tag used in the email digest.
+    """
+    loc  = (location or "").lower()
+    text = f"{loc} {(title or '').lower()} {(content or '').lower()}"
+
+    # 1. Role is explicitly based in India
+    if any(k in loc for k in INDIA_LOCATION_KEYWORDS):
+        return True, "India-based"
+
+    # 2. Remote role explicitly open to candidates worldwide
+    if any(k in text for k in REMOTE_GLOBAL_KEYWORDS):
+        if not any(r in text for r in REMOTE_RESTRICTED_KEYWORDS):
+            return True, "Remote - Worldwide"
+
+    # 2b. Optional: treat a bare "Remote" location as potentially global
+    if TREAT_PLAIN_REMOTE_AS_GLOBAL and "remote" in loc:
+        if not any(r in text for r in REMOTE_RESTRICTED_KEYWORDS):
+            return True, "Remote (unspecified)"
+
+    # 3. Visa sponsorship / relocation explicitly mentioned
+    if any(k in text for k in VISA_SPONSORSHIP_KEYWORDS):
+        return True, "Visa Sponsorship"
+
+    return False, ""
 
 def send_email(jobs: list):
     if not jobs:
@@ -452,19 +548,21 @@ def send_email(jobs: list):
             <td style="padding:10px;border-bottom:1px solid #eee;font-weight:bold;color:#1a1a2e">{j['company']}</td>
             <td style="padding:10px;border-bottom:1px solid #eee;">{j['title']}</td>
             <td style="padding:10px;border-bottom:1px solid #eee;">{j.get('location','India')}</td>
+            <td style="padding:10px;border-bottom:1px solid #eee;"><span style="background:#e0e7ff;color:#3730a3;padding:3px 8px;border-radius:4px;font-size:12px">{j.get('eligibility','-')}</span></td>
             <td style="padding:10px;border-bottom:1px solid #eee;"><a href="{j['url']}" style="background:#4f46e5;color:white;padding:6px 14px;border-radius:4px;text-decoration:none;font-size:13px">Apply</a></td>
         </tr>"""
 
     html = f"""
     <html><body style="font-family:Arial,sans-serif;max-width:900px;margin:auto;padding:20px">
-        <h2 style="color:#1a1a2e">🚀 {len(jobs)} New Job Alert(s) — {datetime.now().strftime('%d %b %Y, %I:%M %p')}</h2>
-        <p style="color:#555">New fresher/SDE/ML openings found across your tracked companies.</p>
+        <h2 style="color:#1a1a2e">🎓 {len(jobs)} New Fresher/Intern Job Alert(s) — {datetime.now().strftime('%d %b %Y, %I:%M %p')}</h2>
+        <p style="color:#555">New fresher &amp; internship openings open to India-based candidates, worldwide remote, or with visa sponsorship.</p>
         <table style="width:100%;border-collapse:collapse;font-size:14px">
             <thead>
                 <tr style="background:#1a1a2e;color:white">
                     <th style="padding:12px;text-align:left">Company</th>
                     <th style="padding:12px;text-align:left">Role</th>
                     <th style="padding:12px;text-align:left">Location</th>
+                    <th style="padding:12px;text-align:left">Eligibility</th>
                     <th style="padding:12px;text-align:left">Link</th>
                 </tr>
             </thead>
@@ -474,7 +572,7 @@ def send_email(jobs: list):
     </body></html>"""
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🚀 {len(jobs)} New Job Alert(s) — {datetime.now().strftime('%d %b')}"
+    msg["Subject"] = f"🎓 {len(jobs)} New Fresher/Intern Job Alert(s) — {datetime.now().strftime('%d %b')}"
     msg["From"]    = SENDER_EMAIL
     msg["To"]      = RECEIVER_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -498,8 +596,16 @@ def fetch_greenhouse(company: str, token: str) -> list:
             title    = job.get("title", "")
             location = job.get("location", {}).get("name", "")
             apply    = job.get("absolute_url", "")
-            if is_relevant(title):
-                jobs.append({"company": company, "title": title, "location": location, "url": apply})
+
+            if not is_relevant(title):
+                continue
+
+            content_text = BeautifulSoup(job.get("content", "") or "", "html.parser").get_text(" ", strip=True)
+            eligible, reason = is_india_eligible(location, content_text, title)
+            if not eligible:
+                continue
+
+            jobs.append({"company": company, "title": title, "location": location, "url": apply, "eligibility": reason})
     except Exception as e:
         print(f"Greenhouse error [{company}]: {e}")
     return jobs
@@ -512,11 +618,21 @@ def fetch_lever(company: str, slug: str) -> list:
         if r.status_code != 200:
             return []
         for job in r.json():
-            title    = job.get("text", "")
-            location = job.get("categories", {}).get("location", "")
-            apply    = job.get("hostedUrl", "")
-            if is_relevant(title):
-                jobs.append({"company": company, "title": title, "location": location, "url": apply})
+            title       = job.get("text", "")
+            categories  = job.get("categories", {}) or {}
+            location    = categories.get("location", "") or ""
+            commitment  = categories.get("commitment", "") or ""
+            apply       = job.get("hostedUrl", "")
+            description = job.get("descriptionPlain", "") or job.get("description", "") or ""
+
+            if not is_relevant(f"{title} {commitment}"):
+                continue
+
+            eligible, reason = is_india_eligible(f"{location} {commitment}", description, title)
+            if not eligible:
+                continue
+
+            jobs.append({"company": company, "title": title, "location": location or commitment, "url": apply, "eligibility": reason})
     except Exception as e:
         print(f"Lever error [{company}]: {e}")
     return jobs
@@ -530,12 +646,21 @@ def fetch_ashby(company: str, slug: str) -> list:
             return []
         data = r.json()
         for job in data.get("jobPostings", []):
-            title    = job.get("title", "")
-            location = job.get("locationName", "")
-            jid      = job.get("id", "")
-            apply    = f"https://jobs.ashbyhq.com/{slug}/{jid}"
-            if is_relevant(title):
-                jobs.append({"company": company, "title": title, "location": location, "url": apply})
+            title           = job.get("title", "")
+            location        = job.get("locationName", "") or ""
+            employment_type = job.get("employmentType", "") or ""
+            workplace_type  = job.get("workplaceType", "") or ""
+            jid             = job.get("id", "")
+            apply           = f"https://jobs.ashbyhq.com/{slug}/{jid}"
+
+            if not is_relevant(f"{title} {employment_type}"):
+                continue
+
+            eligible, reason = is_india_eligible(f"{location} {workplace_type}", "", title)
+            if not eligible:
+                continue
+
+            jobs.append({"company": company, "title": title, "location": location or workplace_type, "url": apply, "eligibility": reason})
     except Exception as e:
         print(f"Ashby error [{company}]: {e}")
     return jobs
@@ -559,10 +684,18 @@ def fetch_scrape(company: str, url: str, selector) -> list:
                 continue
             if title in seen_titles:
                 continue
-            if is_relevant(title):
-                seen_titles.add(title)
-                full_url = href if href.startswith("http") else f"https://{url.split('/')[2]}{href}"
-                jobs.append({"company": company, "title": title, "location": "India", "url": full_url})
+
+            if not is_relevant(title):
+                continue
+
+            # These career pages are India-specific, so default to India-based
+            eligible, reason = is_india_eligible("India", "", title)
+            if not eligible:
+                continue
+
+            seen_titles.add(title)
+            full_url = href if href.startswith("http") else f"https://{url.split('/')[2]}{href}"
+            jobs.append({"company": company, "title": title, "location": "India", "url": full_url, "eligibility": reason})
     except Exception as e:
         print(f"Scrape error [{company}]: {e}")
     return jobs
@@ -570,7 +703,7 @@ def fetch_scrape(company: str, url: str, selector) -> list:
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"🔍 Job Notifier started at {datetime.now()}")
+    print(f"🔍 Fresher/Intern Job Notifier started at {datetime.now()}")
     seen   = load_seen()
     new_jobs = []
 
@@ -615,7 +748,7 @@ def main():
         time.sleep(1)
 
     save_seen(seen)
-    print(f"\n✅ Found {len(new_jobs)} new jobs")
+    print(f"\n✅ Found {len(new_jobs)} new fresher/intern jobs (India / Remote-Worldwide / Visa-Sponsored)")
 
     if new_jobs:
         send_email(new_jobs)
